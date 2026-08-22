@@ -27,6 +27,12 @@ and answer browser requests on the extension's behalf. The server now accepts on
 - **`tabs_move`**, plus a `tabs_list` that can finally see other windows.
 - **Releases are built in public** by GitHub Actions and carry a signed provenance
   attestation: `gh attestation verify 'foxmcp@codemud.org.xpi' --repo ThinkerYzu/foxmcp`.
+  That needs GitHub CLI **2.49 or newer**. An older `gh` has no `attestation`
+  subcommand and answers by printing its list of commands, which reads as a missing
+  attestation rather than an out-of-date client — Ubuntu 26.04 still packages 2.46,
+  so install from [cli.github.com](https://cli.github.com) if apt is your source.
+  The attestation can also be read straight from the API, with no `gh` at all:
+  `curl -s https://api.github.com/repos/ThinkerYzu/foxmcp/attestations/sha256:$(sha256sum 'foxmcp@codemud.org.xpi' | cut -d' ' -f1)`.
 
 ### ⚠️ Breaking
 
