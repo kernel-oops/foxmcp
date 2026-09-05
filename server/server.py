@@ -78,7 +78,7 @@ def find_available_port(start_port=3000, max_attempts=100):
 
 class FoxMCPServer:
     def __init__(self, host: str = "localhost", port: int = 8765, mcp_port: int = None, start_mcp: bool = True,
-                 disabled_tool_groups=None):
+                 disabled_tool_groups=None, enabled_tools=None):
         self.host = host
         self.port = port
 
@@ -116,7 +116,8 @@ class FoxMCPServer:
         self._connection_waiters = []  # List of futures waiting for connection
 
         # Initialize MCP tools
-        self.mcp_tools = FoxMCPTools(self, disabled_groups=disabled_tool_groups)
+        self.mcp_tools = FoxMCPTools(self, disabled_groups=disabled_tool_groups,
+                                     enabled_tools=enabled_tools)
         self.mcp_app = self.mcp_tools.get_mcp_app()
         self.mcp_server_task = None
         self.mcp_thread = None
@@ -701,6 +702,10 @@ async def main():
                              'descriptions never reach the client. Groups: '
                              f"{', '.join(sorted(FoxMCPTools.TOOL_GROUPS))}. "
                              'Overrides FOXMCP_DISABLE_TOOLS.')
+    parser.add_argument('--enable-tools', default=None, metavar='TOOL[,TOOL...]',
+                        help='Comma-separated individual tools to register even though '
+                             'their group is disabled, named as the client sees them '
+                             '(e.g. tabs_capture_screenshot). Overrides FOXMCP_ENABLE_TOOLS.')
 
     args = parser.parse_args()
 
@@ -711,6 +716,11 @@ async def main():
     if group_list is None:
         group_list = os.environ.get('FOXMCP_DISABLE_TOOLS', '')
     disabled_tool_groups = [g.strip() for g in group_list.split(',') if g.strip()]
+
+    tool_list = args.enable_tools
+    if tool_list is None:
+        tool_list = os.environ.get('FOXMCP_ENABLE_TOOLS', '')
+    enabled_tools = [t.strip() for t in tool_list.split(',') if t.strip()]
 
     # FoxMCPTools validates these again in its constructor, which is what enforces
     # the rule; checking here is what turns the ValueError into argparse's usage
@@ -726,13 +736,22 @@ async def main():
         logger.warning(f"Host '{args.host}' changed to 'localhost' for security")
         args.host = 'localhost'
 
-    server = FoxMCPServer(
-        host=args.host,
-        port=args.port,
-        mcp_port=args.mcp_port,
-        start_mcp=not args.no_mcp,
-        disabled_tool_groups=disabled_tool_groups
-    )
+    # --enable-tools is checked here rather than beside --disable-tools above,
+    # because the tool names only exist once the tool definitions have run, which
+    # happens inside this constructor. Turning its ValueError into argparse's
+    # usage message keeps a mistyped tool name reading as a command-line error
+    # rather than a traceback from server startup, the same as a mistyped group.
+    try:
+        server = FoxMCPServer(
+            host=args.host,
+            port=args.port,
+            mcp_port=args.mcp_port,
+            start_mcp=not args.no_mcp,
+            disabled_tool_groups=disabled_tool_groups,
+            enabled_tools=enabled_tools
+        )
+    except ValueError as e:
+        parser.error(str(e))
     await server.start_server()
 
 if __name__ == "__main__":

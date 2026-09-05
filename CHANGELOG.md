@@ -5,6 +5,11 @@ All notable changes to FoxMCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`--enable-tools` keeps one tool out of a group you disabled.** Disabling a group is all-or-nothing, and sometimes a single tool in it is the one worth its tokens: [issue #6](https://github.com/ThinkerYzu/foxmcp/issues/6) asked for a screenshot of the page without the five tab tools that manage tabs, for driving a single-page app. `python server/server.py --disable-tools tabs --enable-tools tabs_capture_screenshot` now does exactly that, and `FOXMCP_ENABLE_TOOLS` does the same for clients that launch the server through a wrapper. The names are the ones the client sees; one that matches no tool is an error, since the symptom would otherwise be the one tool you asked for quietly missing. `tabs_capture_screenshot` is worth naming as the example because it captures the visible tab and takes no tab ID, so it stands on its own — most other tools take a `tab_id` that in practice comes from `tabs_list`. See [`docs/configuration.md`](docs/configuration.md#keeping-one-tool-out-of-a-disabled-group).
+
 ## [1.2.0] - 2026-08-14
 
 **This release removes `get_last_focused_window` and seven protocol action names.**

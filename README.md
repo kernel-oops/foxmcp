@@ -215,11 +215,16 @@ python server/server.py --host 127.0.0.1
 
 # Offer fewer tools, to keep them out of the MCP client's context
 python server/server.py --disable-tools bookmarks,history
+
+# Drop a group but keep one tool out of it
+python server/server.py --disable-tools tabs --enable-tools tabs_capture_screenshot
 ```
 
 All 35 tools are offered by default, costing an MCP client roughly 4,700 tokens of
 context. `--disable-tools` leaves a group unregistered: `windows`, `tabs`,
-`bookmarks`, `navigation`, `content`, `requests`, `history`, `debug`. See
+`bookmarks`, `navigation`, `content`, `requests`, `history`, `debug`.
+`--enable-tools` names individual tools to register anyway, for when one tool out
+of a group is the one you want. See
 [docs/configuration.md](docs/configuration.md#reducing-the-tool-surface) for what
 each group costs.
 

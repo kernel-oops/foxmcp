@@ -187,7 +187,8 @@ make clean && make package && rm -rf dist/profile-cache/*
 
 ### Server
 
-The server takes `--host`, `--port`, `--mcp-port`, `--no-mcp`, and `--disable-tools`:
+The server takes `--host`, `--port`, `--mcp-port`, `--no-mcp`, `--disable-tools` and
+`--enable-tools`:
 
 ```bash
 cd server && python server.py --port 8767

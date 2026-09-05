@@ -8,7 +8,8 @@ All 35 tools are offered by default. Each section below corresponds to a *group*
 that `--disable-tools` can leave unregistered, which is how you shrink what an MCP
 client carries in its context. The group name is the tool-name prefix, not the
 heading: Tab Management is `tabs`, Web Request Monitoring is `requests`, Debugging
-Tools is `debug`. See
+Tools is `debug`. `--enable-tools` takes the tool names below, for keeping one
+tool out of a group you disabled. See
 [configuration.md](configuration.md#reducing-the-tool-surface) for the full list
 and what each group costs.
 

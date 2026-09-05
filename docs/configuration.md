@@ -25,6 +25,8 @@ Options:
   --no-mcp             Disable MCP server
   --disable-tools GROUP[,GROUP...]
                        Tool groups to leave unregistered (default: none)
+  --enable-tools TOOL[,TOOL...]
+                       Individual tools to register anyway (default: none)
   -h, --help           Show help message
 ```
 
@@ -58,18 +60,45 @@ token, so treat them as proportions rather than exact counts:
 All groups are on by default. An unrecognized group name is an error rather than
 a warning, so a typo cannot silently leave the group enabled.
 
-The same list can be set through the environment, for clients that launch the
+Disabling a group hides its tools; it does not restrict the extension, which
+still holds the same browser permissions. This is a context-size option, not a
+security boundary — see [architecture.md](architecture.md#security-architecture).
+
+### Keeping one tool out of a disabled group
+
+Sometimes a single tool is the reason to keep a group, and the rest of it is
+dead weight — a screenshot of the page, without the five tab tools that manage
+tabs. `--enable-tools` names tools to register even though their group is
+disabled:
+
+```bash
+# The page tools, plus a screenshot, and no tab management
+python server/server.py --disable-tools tabs --enable-tools tabs_capture_screenshot
+```
+
+Names are the ones the client sees, as listed in
+[api-reference.md](api-reference.md#available-mcp-tools). Naming a tool whose
+group is enabled anyway does nothing, but a name that matches no tool is an
+error, on the same reasoning as an unknown group: the symptom would otherwise be
+the one tool you wanted quietly missing.
+
+Most tools take a `tab_id` that in practice comes from `tabs_list`, so enabling
+one of those on its own leaves you with a tool you have no way to address.
+`tabs_capture_screenshot` is the exception that makes the example above work: it
+captures the visible tab and takes no tab ID at all.
+
+### Setting both from the environment
+
+Both lists can be set through the environment, for clients that launch the
 server through a wrapper whose arguments you do not control:
 
 ```bash
 export FOXMCP_DISABLE_TOOLS=bookmarks,history
+export FOXMCP_ENABLE_TOOLS=tabs_capture_screenshot
 ```
 
-`--disable-tools` overrides `FOXMCP_DISABLE_TOOLS` when both are given.
-
-Disabling a group hides its tools; it does not restrict the extension, which
-still holds the same browser permissions. This is a context-size option, not a
-security boundary — see [architecture.md](architecture.md#security-architecture).
+`--disable-tools` overrides `FOXMCP_DISABLE_TOOLS`, and `--enable-tools`
+overrides `FOXMCP_ENABLE_TOOLS`, when both are given.
 
 ## Security Features
 
@@ -152,14 +181,15 @@ export FOXMCP_EXT_SCRIPTS="/path/to/your/scripts"
 
 ### Optional Configuration
 
-The server reads two environment variables. `FOXMCP_EXT_SCRIPTS` points at the
+The server reads three environment variables. `FOXMCP_EXT_SCRIPTS` points at the
 directory holding predefined scripts:
 
 ```bash
 export FOXMCP_EXT_SCRIPTS=/path/to/predefined/
 ```
 
-`FOXMCP_DISABLE_TOOLS` names tool groups to leave unregistered — see
+`FOXMCP_DISABLE_TOOLS` names tool groups to leave unregistered, and
+`FOXMCP_ENABLE_TOOLS` names individual tools to register anyway — see
 [Reducing the Tool Surface](#reducing-the-tool-surface).
 
 Ports are set on the command line, not through the environment — see

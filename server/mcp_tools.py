@@ -77,8 +77,10 @@ class FoxMCPTools:
     # touches bookmarks pays for them on every request. The keys are the names
     # --disable-tools accepts; docs/configuration.md lists what each group costs.
     #
-    # This is also the only route by which a tool gets registered, so a new tool
-    # added to any _setup_* method below is disableable without further work.
+    # This is also the only route by which a tool gets registered - every tool
+    # definition goes through _tool while one of these methods is running - so a
+    # new tool added to any _setup_* method below can be disabled with its group,
+    # or enabled on its own, without further work.
     TOOL_GROUPS = {
         'windows': '_setup_window_tools',
         'tabs': '_setup_tab_tools',
@@ -90,16 +92,33 @@ class FoxMCPTools:
         'debug': '_setup_debug_tools',
     }
 
-    def __init__(self, websocket_server, disabled_groups=None):
+    def __init__(self, websocket_server, disabled_groups=None, enabled_tools=None):
         """Initialize with reference to WebSocket server
 
         disabled_groups names tool groups to leave unregistered, so their
         descriptions never reach a client's context - see TOOL_GROUPS for the
-        names. Raises ValueError on a name that is not a group, because a typo
-        that silently registered everything would defeat the point of the option.
+        names. enabled_tools names individual tools to register anyway, for when
+        one tool out of a disabled group is the one that is wanted: disabling
+        'tabs' while enabling 'tabs_capture_screenshot' offers the screenshot
+        without the five tab tools around it.
+
+        Raises ValueError on a name that is not a group, or an enabled_tools name
+        that is not a tool: a typo that silently registered everything - or that
+        silently dropped the one tool that was wanted - would defeat the point of
+        the options.
         """
         self.websocket_server = websocket_server
         self.disabled_groups = self._validate_groups(disabled_groups)
+        self.enabled_tools = set(enabled_tools or ())
+
+        # The group each tool belongs to, filled in by _tool as the definitions run.
+        #
+        # It covers every tool that exists, including the ones left unregistered,
+        # which is what lets an --enable-tools name that matches nothing be
+        # reported as the typo it is.
+        self.group_by_tool = {}
+        self._registering_group = None
+
         self.mcp = FastMCP("FoxMCP")
         self._setup_tools()
 
@@ -121,17 +140,75 @@ class FoxMCPTools:
         return groups
 
     def _setup_tools(self):
-        """Set up all MCP tool definitions, minus any disabled group"""
+        """Set up all MCP tool definitions, minus any disabled group
+
+        Every group's definitions run even when the group is disabled, because
+        defining a tool is not registering it - _tool decides that, and needs to
+        see each definition to record the name. Running them all is what builds
+        the catalogue that _validate_tools checks --enable-tools against.
+        """
         for group, setup_method in self.TOOL_GROUPS.items():
-            if group in self.disabled_groups:
-                logger.info(f"Tool group '{group}' disabled - not registering its tools")
-                continue
+            self._registering_group = group
             getattr(self, setup_method)()
+        self._registering_group = None
+
+        self._validate_tools()
+        self._log_disabled_groups()
+
+    def _tool(self):
+        """Return the decorator that registers one tool, in place of @self.mcp.tool()
+
+        Every tool definition below goes through here, which is what gives
+        --enable-tools its per-tool grip: this is the one place that knows both
+        the group being set up and the name of the tool being defined. A tool
+        from a disabled group is registered only if it was named individually.
+
+        A tool that is not registered is still recorded in group_by_tool, and the
+        undecorated function is handed back - the closure stays defined, and no
+        MCP client ever hears about it.
+        """
+        group = self._registering_group
+
+        def register(fn):
+            self.group_by_tool[fn.__name__] = group
+            if group in self.disabled_groups and fn.__name__ not in self.enabled_tools:
+                return fn
+            return self.mcp.tool()(fn)
+
+        return register
+
+    def _validate_tools(self):
+        """Check enabled_tools against the tools that exist, once they have been defined
+
+        Raises ValueError naming both the unknown tools and every valid name. The
+        message reaches a user through server.py's --enable-tools, so it carries
+        the whole list rather than telling them where to look it up.
+        """
+        unknown = sorted(self.enabled_tools - set(self.group_by_tool))
+        if unknown:
+            raise ValueError(
+                f"Unknown tool(s): {', '.join(unknown)}. "
+                f"Valid tools: {', '.join(sorted(self.group_by_tool))}"
+            )
+
+    def _log_disabled_groups(self):
+        """Log each disabled group, and any of its tools that were kept anyway"""
+        for group in sorted(self.disabled_groups):
+            kept = sorted(
+                name for name, tool_group in self.group_by_tool.items()
+                if tool_group == group and name in self.enabled_tools
+            )
+            if kept:
+                logger.info(
+                    f"Tool group '{group}' disabled - registering only: {', '.join(kept)}"
+                )
+            else:
+                logger.info(f"Tool group '{group}' disabled - not registering its tools")
 
     def _setup_window_tools(self):
         """Setup window management tools"""
 
-        @self.mcp.tool()
+        @self._tool()
         async def list_windows(populate: bool = True) -> str:
             """
             List all browser windows
@@ -172,7 +249,7 @@ class FoxMCPTools:
 
             return "Unable to retrieve windows"
 
-        @self.mcp.tool()
+        @self._tool()
         async def get_window(window_id: int, populate: bool = True) -> str:
             """
             Get information about a specific window
@@ -219,7 +296,7 @@ class FoxMCPTools:
         # context's viewType is "background" - which is the only context this
         # extension has. So both calls evaluate the same expression. A separate tool
         # shipped until 1.2.0 and always returned the same window as this one.
-        @self.mcp.tool()
+        @self._tool()
         async def get_current_window(populate: bool = True) -> str:
             """Get the current active window, which is also the last focused window
 
@@ -251,7 +328,7 @@ class FoxMCPTools:
 
             return "Unable to retrieve current window"
 
-        @self.mcp.tool()
+        @self._tool()
         async def create_window(
             url: Optional[str] = None,
             window_type: str = "normal",
@@ -310,7 +387,7 @@ class FoxMCPTools:
 
             return "Window created but unable to retrieve details"
 
-        @self.mcp.tool() 
+        @self._tool() 
         async def close_window(window_id: int) -> str:
             """
             Close a browser window
@@ -342,7 +419,7 @@ class FoxMCPTools:
 
             return f"Unable to close window {window_id}"
 
-        @self.mcp.tool()
+        @self._tool()
         async def focus_window(window_id: int) -> str:
             """
             Bring a window to front and focus it
@@ -374,7 +451,7 @@ class FoxMCPTools:
 
             return f"Unable to focus window {window_id}"
 
-        @self.mcp.tool()
+        @self._tool()
         async def update_window(
             window_id: int,
             state: Optional[str] = None,
@@ -435,7 +512,7 @@ class FoxMCPTools:
         """Setup tab management tools"""
 
         # Tab List Tool
-        @self.mcp.tool()
+        @self._tool()
         async def tabs_list(window_id: Optional[Union[int, str]] = None) -> str:
             """
             List open browser tabs, across every window or within one window
@@ -507,7 +584,7 @@ class FoxMCPTools:
             return "Unable to retrieve tabs"
 
         # Tab Create Tool
-        @self.mcp.tool()
+        @self._tool()
         async def tabs_create(
             url: str,
             active: bool = True,
@@ -554,7 +631,7 @@ class FoxMCPTools:
             return "Unable to create tab"
 
         # Tab Close Tool
-        @self.mcp.tool()
+        @self._tool()
         async def tabs_close(tab_id: int) -> str:
             """Close a browser tab
 
@@ -585,7 +662,7 @@ class FoxMCPTools:
             return f"Unable to close tab {tab_id}"
 
         # Tab Switch Tool
-        @self.mcp.tool()
+        @self._tool()
         async def tabs_switch(tab_id: int) -> str:
             """Switch to a specific browser tab
 
@@ -616,7 +693,7 @@ class FoxMCPTools:
             return f"Unable to switch to tab {tab_id}"
 
         # Tab Move Tool
-        @self.mcp.tool()
+        @self._tool()
         async def tabs_move(
             tab_ids: Union[int, str, List[Union[int, str]]],
             window_id: Optional[Union[int, str]] = None,
@@ -720,7 +797,7 @@ class FoxMCPTools:
             return "Unable to move tabs"
 
         # Tab Screenshot Tool
-        @self.mcp.tool()
+        @self._tool()
         async def tabs_capture_screenshot(
             filename: Optional[str] = None,
             window_id: Optional[int] = None,
@@ -810,7 +887,7 @@ class FoxMCPTools:
         """Setup history management tools"""
 
         # History Query Tool
-        @self.mcp.tool()
+        @self._tool()
         async def history_query(
             query: str,
             max_results: int = 200,
@@ -861,7 +938,7 @@ class FoxMCPTools:
             return f"Unable to query history for: {query}"
 
         # Get Recent History Tool
-        @self.mcp.tool()
+        @self._tool()
         async def history_get_recent(count: int = 10) -> str:
             """Get recent browser history
 
@@ -904,7 +981,7 @@ class FoxMCPTools:
             return f"Unable to get recent history. Response type: {response.get('type')}, has_data: {'data' in response}, keys: {list(response.keys())}"
 
         # Delete History Item Tool
-        @self.mcp.tool()
+        @self._tool()
         async def history_delete_item(url: str) -> str:
             """Delete a specific history item
 
@@ -938,7 +1015,7 @@ class FoxMCPTools:
         """Setup bookmark management tools"""
 
         # List Bookmarks Tool
-        @self.mcp.tool()
+        @self._tool()
         async def bookmarks_list(folder_id: Optional[str] = None) -> str:
             """List browser bookmarks
 
@@ -992,7 +1069,7 @@ class FoxMCPTools:
             return "Unable to list bookmarks"
 
         # Search Bookmarks Tool
-        @self.mcp.tool()
+        @self._tool()
         async def bookmarks_search(query: str) -> str:
             """Search browser bookmarks by title or URL
 
@@ -1043,7 +1120,7 @@ class FoxMCPTools:
             return f"Unable to search bookmarks for: {query}"
 
         # Create Bookmark Tool
-        @self.mcp.tool()
+        @self._tool()
         async def bookmarks_create(
             title: str,
             url: str,
@@ -1083,7 +1160,7 @@ class FoxMCPTools:
             return f"Unable to create bookmark: {title}"
 
         # Create Bookmark Folder Tool
-        @self.mcp.tool()
+        @self._tool()
         async def bookmarks_create_folder(
             title: str,
             parent_id: Optional[str] = None
@@ -1120,7 +1197,7 @@ class FoxMCPTools:
             return f"Unable to create folder: {title}"
 
         # Update Bookmark Tool
-        @self.mcp.tool()
+        @self._tool()
         async def bookmarks_update(
             bookmark_id: str,
             title: Optional[str] = None,
@@ -1163,7 +1240,7 @@ class FoxMCPTools:
             return f"Unable to update bookmark: {bookmark_id}"
 
         # Delete Bookmark Tool
-        @self.mcp.tool()
+        @self._tool()
         async def bookmarks_delete(bookmark_id: str) -> str:
             """Delete a bookmark
 
@@ -1196,7 +1273,7 @@ class FoxMCPTools:
     def _setup_debug_tools(self):
         """Setup connection diagnostics tools"""
 
-        @self.mcp.tool()
+        @self._tool()
         async def debug_websocket_status() -> str:
             """Debug WebSocket connection status
 
@@ -1231,7 +1308,7 @@ class FoxMCPTools:
             """Parameters for navigating back"""
             tab_id: int = Field(description="ID of the tab to navigate back in")
 
-        @self.mcp.tool()
+        @self._tool()
         async def navigation_back(params: NavigationBackParams) -> str:
             """Navigate back in browser history for a tab"""
             request = {
@@ -1262,7 +1339,7 @@ class FoxMCPTools:
             """Parameters for navigating forward"""
             tab_id: int = Field(description="ID of the tab to navigate forward in")
 
-        @self.mcp.tool()
+        @self._tool()
         async def navigation_forward(params: NavigationForwardParams) -> str:
             """Navigate forward in browser history for a tab"""
             request = {
@@ -1289,7 +1366,7 @@ class FoxMCPTools:
             return f"Unable to navigate forward in tab {params.tab_id}"
 
         # Reload Page Tool
-        @self.mcp.tool()
+        @self._tool()
         async def navigation_reload(tab_id: int, bypass_cache: bool = False) -> str:
             """Reload a page in a tab
 
@@ -1323,7 +1400,7 @@ class FoxMCPTools:
             return f"Unable to reload tab {tab_id}"
 
         # Go to URL Tool
-        @self.mcp.tool()
+        @self._tool()
         async def navigation_go_to_url(tab_id: int, url: str) -> str:
             """Navigate to a specific URL in a tab
 
@@ -1359,7 +1436,7 @@ class FoxMCPTools:
         """Setup content access tools"""
 
         # Get Page Text Tool
-        @self.mcp.tool()
+        @self._tool()
         async def content_get_text(tab_id: int, max_length: Optional[int] = None) -> str:
             """Get text content from a tab's page
 
@@ -1403,7 +1480,7 @@ class FoxMCPTools:
             return f"Unable to get text content from tab {tab_id}"
 
         # Get Page HTML Tool
-        @self.mcp.tool()
+        @self._tool()
         async def content_get_html(tab_id: int) -> str:
             """Get HTML content from a tab's page
 
@@ -1441,7 +1518,7 @@ class FoxMCPTools:
             return f"Unable to get HTML content from tab {tab_id}"
 
         # Execute Script Tool
-        @self.mcp.tool()
+        @self._tool()
         async def content_execute_script(tab_id: int, code: str) -> str:
             """Execute JavaScript code in a tab
 
@@ -1480,7 +1557,7 @@ class FoxMCPTools:
             return f"Unable to execute script in tab {tab_id}"
 
         # Execute Predefined Script Tool
-        @self.mcp.tool()
+        @self._tool()
         async def content_execute_predefined(
             tab_id: int,
             script_name: str,
@@ -1663,7 +1740,7 @@ class FoxMCPTools:
     def _setup_request_monitoring_tools(self):
         """Setup web request monitoring tools"""
 
-        @self.mcp.tool()
+        @self._tool()
         async def requests_start_monitoring(
             url_patterns: List[str],
             options: Optional[Dict[str, Any]] = None,
@@ -1734,7 +1811,7 @@ class FoxMCPTools:
 
             return json.dumps({"error": "Unable to start monitoring"})
 
-        @self.mcp.tool()
+        @self._tool()
         async def requests_stop_monitoring(
             monitor_id: str,
             drain_timeout: int = 5
@@ -1773,7 +1850,7 @@ class FoxMCPTools:
 
             return json.dumps({"error": "Unable to stop monitoring"})
 
-        @self.mcp.tool()
+        @self._tool()
         async def requests_list_captured(monitor_id: str) -> str:
             """
             List all captured request summaries from a monitoring session
@@ -1807,7 +1884,7 @@ class FoxMCPTools:
 
             return json.dumps({"error": "Unable to list captured requests"})
 
-        @self.mcp.tool()
+        @self._tool()
         async def requests_get_content(
             monitor_id: str,
             request_id: str,

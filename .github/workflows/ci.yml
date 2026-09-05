@@ -167,6 +167,31 @@ jobs:
           asyncio.run(main())
           PY
 
+      - name: A tool named individually must survive its disabled group
+        shell: bash
+        run: |
+          set -euo pipefail
+          venv/bin/python server/server.py --port 18767 --mcp-port 13002 \
+            --disable-tools tabs --enable-tools tabs_capture_screenshot &
+          server_pid=$!
+          trap 'kill $server_pid' EXIT
+          sleep 5
+
+          venv/bin/python - <<'PY'
+          import asyncio
+          from fastmcp import Client
+
+          async def main():
+              async with Client("http://localhost:13002/mcp/") as client:
+                  names = {tool.name for tool in await client.list_tools()}
+                  assert len(names) == 30, f"expected 30 tools, got {len(names)}"
+                  assert "tabs_capture_screenshot" in names
+                  assert not [n for n in names
+                              if n.startswith("tabs_") and n != "tabs_capture_screenshot"]
+
+          asyncio.run(main())
+          PY
+
   package:
     name: Build packages
     runs-on: ubuntu-latest
