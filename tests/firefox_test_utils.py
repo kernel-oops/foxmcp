@@ -170,9 +170,22 @@ class FirefoxTestManager:
             return None
 
     def _extract_profile(self, compressed_path, target_dir):
-        """Extract compressed profile to target directory"""
+        """Extract compressed profile to target directory
+
+        compatibility.ini is dropped on the way out. It records the exact Firefox
+        build that last opened the profile, and a cache is easily built by one
+        build and reused by another - a Nightly in a scratchpad directory, then
+        the system snap. Firefox answers a stamp it does not recognise with
+        "This profile was last used with a newer version of this application"
+        and exits, so the profile has to arrive without an opinion about which
+        build owns it. Firefox writes a fresh one at startup.
+        """
         with tarfile.open(compressed_path, 'r:gz') as tar:
             tar.extractall(target_dir)
+
+        stamp = os.path.join(target_dir, 'compatibility.ini')
+        if os.path.exists(stamp):
+            os.remove(stamp)
 
     def _compress_profile(self, profile_dir, output_path):
         """Compress profile directory to .tar.gz file"""
@@ -675,19 +688,30 @@ user_pref("extensions.foxmcp.testPort", ''' + str(self.test_port) + ''');
         if headless:
             firefox_cmd.append('-headless')
 
+        # Firefox explains its own startup failures on stderr, and sending that to
+        # DEVNULL leaves "exited immediately (code: 1)" as the only symptom - true
+        # of a missing profile, a rejected profile and a broken build alike. Kept
+        # in the profile so cleanup() takes it away with everything else.
+        stderr_log = os.path.join(self.profile_dir, 'firefox-stderr.log')
+
         try:
-            self.firefox_process = subprocess.Popen(
-                firefox_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
+            with open(stderr_log, 'wb') as log:
+                self.firefox_process = subprocess.Popen(
+                    firefox_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=log
+                )
 
             if wait_for_startup:
                 time.sleep(FIREFOX_TEST_CONFIG['firefox_startup_wait'])
 
                 # Check if process is still running
                 if self.firefox_process.poll() is not None:
-                    raise Exception(f"Firefox process exited immediately (code: {self.firefox_process.returncode})")
+                    raise Exception(
+                        f"Firefox process exited immediately "
+                        f"(code: {self.firefox_process.returncode}). "
+                        f"Firefox said: {self._read_stderr_log(stderr_log)}"
+                    )
 
             print(f"✓ Firefox started with test profile (PID: {self.firefox_process.pid})")
             return True
@@ -695,6 +719,21 @@ user_pref("extensions.foxmcp.testPort", ''' + str(self.test_port) + ''');
         except Exception as e:
             print(f"✗ Failed to start Firefox: {e}")
             return False
+
+    @staticmethod
+    def _read_stderr_log(path):
+        """Return what Firefox wrote to stderr, as one line fit for an exception
+
+        Only the tail is worth reporting: GTK and the headless notice come first,
+        and the reason it gave up is last.
+        """
+        try:
+            with open(path, 'r', errors='replace') as log:
+                lines = [line.strip() for line in log if line.strip()]
+        except OSError as e:
+            return f"(could not read {path}: {e})"
+
+        return ' | '.join(lines[-3:]) if lines else '(nothing)'
 
     def wait_for_extension_connection(self, timeout=10.0, server=None):
         """Wait for extension to connect to test server
