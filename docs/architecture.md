@@ -70,7 +70,7 @@ The Firefox extension acts as a bridge between WebExtensions APIs and MCP client
 - **Lifecycle**: Graceful startup and shutdown, including cleanup of the extension connection
 
 #### MCP Tools (`mcp_tools.py`)
-- **MCP Tool Definitions**: 36 browser functions registered as MCP tools on a `FastMCP("FoxMCP")` instance
+- **MCP Tool Definitions**: 35 browser functions registered as MCP tools on a `FastMCP("FoxMCP")` instance
 - **Parameter Validation**: Type-annotated tool signatures; FastMCP derives the schema
 - **Response Formatting**: Each tool turns the raw browser response into a human-readable string
 - **Error Handling**: Every tool checks for `error` in the response before reading data
@@ -95,6 +95,11 @@ Actions are namespaced with a dot — `windows.get`, `tabs.list`, `bookmarks.cre
 - **Parameter Schema**: Type-safe parameter definitions
 - **Result Formatting**: Consistent response formatting
 - **Error Codes**: Standardized error handling
+- **Transport**: HTTP on port 3000 by default, run by uvicorn in a thread of its
+  own. `--stdio` serves the same tools on the process's stdin and stdout instead,
+  for clients that launch their servers; there the MCP server is an asyncio task
+  beside the WebSocket server rather than a thread, since the stdio transport is
+  asyncio throughout. The WebSocket half is identical either way
 
 ## Data Flow
 
@@ -196,7 +201,7 @@ Tested in `tests/integration/test_connection_origin.py`. Test clients standing i
 ### 1. Connection Management
 - **Single Extension Connection**: One extension connection at a time. When a new one arrives, the server closes the existing connection first, which prevents connection races between two browsers or a stale socket.
 - **MCP Clients**: Served by FastMCP. There is no per-client state — all clients share the one extension connection, and requests from different clients interleave.
-- **Reconnection Logic**: The extension retries indefinitely by default (`maxRetries: -1`, subject to an absolute ceiling) and reconnects when settings change.
+- **Reconnection Logic**: The extension retries every `retryInterval` (5000 ms by default) and reconnects when settings change. `maxRetries: -1` removes the configured limit but not `MAX_ABSOLUTE_RETRIES`, a hard ceiling of 50 attempts in `background.js`; past it the extension stays down until **Reconnect** in the popup resets the counter.
 
 ### 2. Request Handling
 - **Async Processing**: All operations are asynchronous
@@ -309,7 +314,8 @@ server = FoxMCPServer(
     host="localhost",      # Security: localhost only
     port=8765,             # WebSocket port
     mcp_port=3000,         # MCP server port (None → 3000, or dynamic under pytest)
-    start_mcp=True         # Enable MCP integration
+    start_mcp=True,        # Enable MCP integration
+    use_stdio=False        # True: serve MCP on stdin/stdout, and open no HTTP port
 )
 ```
 
@@ -318,6 +324,7 @@ Or from the command line:
 ```bash
 python server/server.py --host localhost --port 8765 --mcp-port 3000
 python server/server.py --no-mcp          # WebSocket only
+python server/server.py --stdio           # MCP on stdin/stdout, no HTTP listener
 ```
 
 ### 2. Extension Configuration

@@ -958,8 +958,11 @@ class FoxMCPTools:
             response = await self.websocket_server.send_request_and_wait(request)
 
             # Debug logging for troubleshooting
-            import json
-            print(f"🔍 DEBUG - Recent history WebSocket response: {json.dumps(response, indent=2)}")
+            #
+            # A print() here would go to stdout, which under --stdio carries the
+            # JSON-RPC framing: dumping a response there breaks the client's
+            # connection on the first call to this tool.
+            logger.debug(f"Recent history WebSocket response: {json.dumps(response, indent=2)}")
 
             if "error" in response:
                 return f"Error getting recent history: {response['error']}"

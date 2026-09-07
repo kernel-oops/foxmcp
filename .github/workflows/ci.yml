@@ -102,7 +102,8 @@ jobs:
     # rest of CI does not: setup-python-env creates the venv itself and runs
     # `make setup`, so `make install` — what the README tells a user to run — is
     # never exercised. This job is also the only check that the server starts and
-    # serves tools to a client over HTTP, rather than to a test fixture.
+    # serves tools to a real MCP client - over HTTP, and over stdio, where the
+    # client launches the server itself - rather than to a test fixture.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -163,6 +164,36 @@ jobs:
                   assert len(names) == 26, f"expected 26 tools, got {len(names)}"
                   assert not [n for n in names if n.startswith(("bookmarks_", "history_"))]
                   assert "tabs_list" in names
+
+          asyncio.run(main())
+          PY
+
+      - name: A client must be able to launch the server over stdio
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No background server here: the client starts it, which is the mode.
+          venv/bin/python - <<'PY'
+          import asyncio
+          from fastmcp import Client
+          from fastmcp.client.transports import PythonStdioTransport
+
+          EXPECTED = 35
+
+          async def main():
+              transport = PythonStdioTransport(
+                  script_path="server/server.py",
+                  args=["--stdio", "--port", "18768"],
+              )
+              async with Client(transport) as client:
+                  names = sorted(tool.name for tool in await client.list_tools())
+                  print(f"{len(names)} tools over stdio: {', '.join(names)}")
+                  assert len(names) == EXPECTED, f"expected {EXPECTED} tools, got {len(names)}"
+
+                  # Reaches the bridge and comes back as a result rather than a
+                  # protocol error, which is what a stray write to stdout would be.
+                  result = await client.call_tool("tabs_list", {})
+                  assert "No extension connection" in result.content[0].text
 
           asyncio.run(main())
           PY

@@ -35,7 +35,12 @@ except ImportError:
     HAS_PORT_COORDINATOR = False
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+#
+# stderr is already basicConfig's default, but it is named here because with
+# --stdio the process speaks JSON-RPC over stdout: a single log line written
+# there breaks the framing and the client drops the connection. Anything in
+# this process that has something to say says it on stderr.
+logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger(__name__)
 
 # Only browser extensions may open the extension WebSocket.
@@ -78,12 +83,19 @@ def find_available_port(start_port=3000, max_attempts=100):
 
 class FoxMCPServer:
     def __init__(self, host: str = "localhost", port: int = 8765, mcp_port: int = None, start_mcp: bool = True,
-                 disabled_tool_groups=None, enabled_tools=None):
+                 disabled_tool_groups=None, enabled_tools=None, use_stdio: bool = False):
         self.host = host
         self.port = port
+        self.use_stdio = use_stdio
 
+        # In stdio mode the MCP side has no listener, so there is no port to pick.
+        # Running the selection anyway would bind-test a port nothing serves and
+        # report "port in use" against whatever else holds 3000 - most likely the
+        # user's own HTTP-mode server, which is not a conflict at all here.
+        if use_stdio:
+            self.mcp_port = None
         # Set MCP port - default to 3000 for production, dynamic allocation only for tests
-        if mcp_port is None:
+        elif mcp_port is None:
             # Check if we're in a test environment by checking for pytest or explicit test indicators
             in_test_env = ('pytest' in sys.modules or
                           'PYTEST_CURRENT_TEST' in os.environ or
@@ -105,7 +117,8 @@ class FoxMCPServer:
                 logger.warning(f"Requested MCP port {mcp_port} is in use, finding alternative...")
                 self.mcp_port = find_available_port(mcp_port)
 
-        logger.info(f"MCP server will use port {self.mcp_port}")
+        if self.mcp_port is not None:
+            logger.info(f"MCP server will use port {self.mcp_port}")
         self.start_mcp = start_mcp
 
         # SINGLE CONNECTION CONSTRAINT: Only one extension connection allowed
@@ -663,28 +676,95 @@ class FoxMCPServer:
         logger.info(f"Starting FoxMCP server on {self.host}:{self.port}")
 
         # Start MCP server first (if enabled)
-        if self.start_mcp:
+        #
+        # stdio is the exception, and starts below instead: HTTP mode hands
+        # uvicorn a thread and returns, while the stdio transport runs in this
+        # loop until the client hangs up. Awaiting it here would mean never
+        # reaching the WebSocket server it depends on.
+        if self.start_mcp and not self.use_stdio:
             await self.start_mcp_server()
             logger.info(f"MCP tools available at http://{self.host}:{self.mcp_port}/")
-        else:
+        elif not self.start_mcp:
             logger.info("MCP server disabled for this instance")
 
         # Use modern websockets API with SO_REUSEADDR
         import socket
-        self.websocket_server = await websockets.serve(
-            self.handle_extension_connection,
-            self.host,
-            self.port,
-            reuse_address=True,  # Enable SO_REUSEADDR for immediate port reuse
-            # Rejected during the handshake, so a non-extension client never
-            # reaches handle_extension_connection - which would otherwise close
-            # the real extension's socket to make room for it.
-            origins=[EXTENSION_ORIGIN_PATTERN],
-            process_response=self.log_rejected_handshake
-        )
+        try:
+            self.websocket_server = await websockets.serve(
+                self.handle_extension_connection,
+                self.host,
+                self.port,
+                reuse_address=True,  # Enable SO_REUSEADDR for immediate port reuse
+                # Rejected during the handshake, so a non-extension client never
+                # reaches handle_extension_connection - which would otherwise close
+                # the real extension's socket to make room for it.
+                origins=[EXTENSION_ORIGIN_PATTERN],
+                process_response=self.log_rejected_handshake
+            )
+        except OSError as e:
+            # The extension reaches one fixed port, so only one server can hold
+            # it. That is easy to hit in stdio mode, where every MCP client
+            # launches a server of its own, and the bare errno does not say so.
+            logger.error(
+                f"Cannot listen on {self.host}:{self.port} for the extension: {e}. "
+                "Another FoxMCP server is most likely already running - the "
+                "extension connects to one port, so only one server can serve it."
+            )
+            raise
 
         logger.info("FoxMCP WebSocket server is running...")
-        await self.websocket_server.wait_closed()
+
+        if self.start_mcp and self.use_stdio:
+            await self._serve_mcp_over_stdio()
+        else:
+            await self.websocket_server.wait_closed()
+
+    async def _serve_mcp_over_stdio(self):
+        """Serve MCP on stdin/stdout until the client hangs up, then release the port
+
+        Only reached with --stdio, and only after the WebSocket server is
+        listening. Returns when either side finishes: the client closing stdin
+        is the normal end, and a WebSocket server that stops is a reason to stop
+        answering tool calls it can no longer carry out.
+
+        Unlike HTTP mode, the MCP server runs as a task in this loop rather than
+        in a uvicorn thread, because the stdio transport is asyncio all the way
+        down and has no thread of its own to run in.
+        """
+        logger.info("MCP serving over stdio; no HTTP listener")
+
+        # show_banner=False keeps startup off the network as well as quiet: the
+        # banner asks PyPI whether a newer fastmcp exists, which is a delay a
+        # client is waiting on and a request the user did not ask for.
+        mcp_task = asyncio.create_task(
+            self.mcp_app.run_async(transport="stdio", show_banner=False),
+            name="foxmcp-stdio"
+        )
+        websocket_task = asyncio.create_task(
+            self.websocket_server.wait_closed(),
+            name="foxmcp-websocket"
+        )
+
+        try:
+            done, _ = await asyncio.wait(
+                {mcp_task, websocket_task},
+                return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in (mcp_task, websocket_task):
+                task.cancel()
+
+            # Awaited, not just cancelled: _stop_websocket_server() below waits
+            # for the port to be released, and a live stdio task still holding
+            # the connection open would make that wait pointless.
+            await asyncio.gather(mcp_task, websocket_task, return_exceptions=True)
+            await self._stop()
+
+        # A tool that raised inside the transport is the client's problem to see,
+        # so it is re-raised rather than logged as a clean shutdown.
+        for task in done:
+            if not task.cancelled() and task.exception() is not None:
+                raise task.exception()
 
 async def main():
     """Main entry point"""
@@ -697,6 +777,10 @@ async def main():
                         help='MCP server port (default: 3000, dynamic allocation in tests)')
     parser.add_argument('--no-mcp', action='store_true',
                         help='Disable MCP server')
+    parser.add_argument('--stdio', action='store_true',
+                        help='Serve MCP over stdin/stdout instead of HTTP, so an MCP '
+                             'client can launch the server itself. The WebSocket port '
+                             'for the extension is unchanged.')
     parser.add_argument('--disable-tools', default=None, metavar='GROUP[,GROUP...]',
                         help='Comma-separated tool groups to leave unregistered, so their '
                              'descriptions never reach the client. Groups: '
@@ -708,6 +792,17 @@ async def main():
                              '(e.g. tabs_capture_screenshot). Overrides FOXMCP_ENABLE_TOOLS.')
 
     args = parser.parse_args()
+
+    # Both of these are silent no-ops rather than errors if left to run, and a
+    # user who typed them meant something by them. --no-mcp with --stdio asks for
+    # a server with nothing on its stdout, which no client can use; --mcp-port
+    # names a listener stdio mode does not open.
+    if args.stdio and args.no_mcp:
+        parser.error('--stdio and --no-mcp cannot be combined: stdio mode exists to '
+                     'serve MCP, and --no-mcp turns it off')
+    if args.stdio and args.mcp_port is not None:
+        parser.error('--mcp-port has no meaning with --stdio: stdio mode serves MCP on '
+                     'stdin/stdout and opens no HTTP listener')
 
     # FOXMCP_DISABLE_TOOLS is the same setting for a client that launches the server
     # through a wrapper: an MCP client config names the command and sets the
@@ -748,7 +843,8 @@ async def main():
             mcp_port=args.mcp_port,
             start_mcp=not args.no_mcp,
             disabled_tool_groups=disabled_tool_groups,
-            enabled_tools=enabled_tools
+            enabled_tools=enabled_tools,
+            use_stdio=args.stdio
         )
     except ValueError as e:
         parser.error(str(e))
@@ -761,3 +857,8 @@ if __name__ == "__main__":
         logger.info("Server stopped by user")
     except Exception as e:
         logger.error(f"Server error: {e}")
+        # A server that could not start is a failure, and exiting 0 told every
+        # caller otherwise. It matters most under --stdio: the client that
+        # launched the process reports what it exited with, and often shows
+        # nothing else.
+        sys.exit(1)

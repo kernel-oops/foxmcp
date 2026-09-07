@@ -11,6 +11,7 @@ make run-server
 # Custom configuration
 python server/server.py --port 9000 --mcp-port 4000
 python server/server.py --no-mcp  # WebSocket only, disable MCP server
+python server/server.py --stdio   # MCP on stdin/stdout, for a client that launches it
 ```
 
 ## Command Line Options
@@ -23,12 +24,152 @@ Options:
   --port PORT          WebSocket port (default: 8765)
   --mcp-port MCP_PORT  MCP server port (default: 3000)
   --no-mcp             Disable MCP server
+  --stdio              Serve MCP on stdin/stdout instead of HTTP
   --disable-tools GROUP[,GROUP...]
                        Tool groups to leave unregistered (default: none)
   --enable-tools TOOL[,TOOL...]
                        Individual tools to register anyway (default: none)
   -h, --help           Show help message
 ```
+
+## Serving MCP over stdio
+
+By default the server offers MCP over HTTP, which means starting it yourself and
+leaving it running. `--stdio` offers the same tools on stdin and stdout instead,
+so an MCP client can launch the server itself and shut it down again when it
+exits — the way most clients expect to manage a server.
+
+**Claude Code**, from the directory you want it scoped to:
+
+```bash
+claude mcp add --scope project foxmcp -- /path/to/foxmcp/venv/bin/python \
+  /path/to/foxmcp/server/server.py --stdio
+```
+
+which writes a `.mcp.json` any MCP client can read:
+
+```json
+{
+  "mcpServers": {
+    "foxmcp": {
+      "type": "stdio",
+      "command": "/path/to/foxmcp/venv/bin/python",
+      "args": ["/path/to/foxmcp/server/server.py", "--stdio"],
+      "env": {}
+    }
+  }
+}
+```
+
+Name `venv/bin/python` rather than `python`: the server needs the virtual
+environment's packages, and a client launches the command with its own
+environment, not your shell's. On Windows the interpreter is
+`venv\Scripts\python.exe`.
+
+The extension side does not change. The WebSocket server still listens on 8765,
+the extension still connects to it, and every tool works as it does over HTTP.
+Three things are different:
+
+- **No HTTP listener.** Nothing serves port 3000, so `--mcp-port` is refused
+  rather than silently ignored. `--no-mcp` is refused too, since it would leave
+  stdio mode with nothing to serve.
+- **The server lives as long as the client.** Closing the client ends the
+  process, and the next client starts a new one. That has two consequences worth
+  reading before you choose this mode: [One session at a
+  time](#one-session-at-a-time) and [The reconnect gap](#the-reconnect-gap).
+- **stdout carries the protocol.** All logging goes to stderr, where your client
+  keeps its MCP server logs.
+
+### One session at a time
+
+The extension dials a single WebSocket port, so a single server can serve it.
+That is true in either mode. In HTTP mode it is a setup decision you make once.
+Under `--stdio` it becomes a limit on how you work, because every client that
+launches a server launches its own.
+
+Two `claude` sessions in two terminals means two servers. The first binds 8765
+and gets the browser. The second exits with an error naming the port, and that
+client has no browser tools at all:
+
+```
+terminal 1:  claude  ->  server starts, binds 8765, extension attaches
+terminal 2:  claude  ->  server exits: "Cannot listen on localhost:8765"
+```
+
+That is a normal way to work rather than a misconfiguration, and the server
+cannot solve it. A second server on another port would have nothing to serve,
+because the extension is configured to dial one address.
+
+Mixing modes collides the same way: a standing HTTP-mode server holds 8765, so a
+client's `--stdio` server cannot start. If you want several clients at once, run
+one server in HTTP mode and point them all at `http://localhost:3000/mcp/`.
+
+### The reconnect gap
+
+The extension opens the WebSocket connection, not the server. The server only
+listens on 8765 and waits. Over HTTP that ordering never matters, because you
+start the server once and leave it running: it is up before Firefox connects and
+still up after. Under `--stdio` the server is the short-lived side, alive only
+while your MCP client is, and the two have no way to coordinate.
+
+Two things follow, and neither is fixed in the server.
+
+**A tool call in the first few seconds fails.** The server accepts MCP requests
+as soon as your client launches it, but the extension is somewhere in its
+five-second retry cycle and has not connected yet. A tool call in that window
+returns `No extension connection available` immediately rather than waiting for
+the browser. Run it again.
+
+**The extension gives up after about four minutes without a server.** It retries
+50 times and then stops for good. That limit is fixed in the extension and the
+**Max Retries** setting does not lift it: setting -1 (unlimited) still stops at
+50. At the default five-second Retry Interval that is 250 seconds.
+
+The four minutes is the part that bites, because it is not a race you usually
+win or lose. It is the normal outcome of leaving Firefox open and your editor
+closed. Close the editor at lunch, come back, and the extension has been done
+trying for an hour:
+
+```
+12:00  editor exits, server dies
+12:00  extension starts retrying, every 5s
+12:04  50 attempts spent, extension stops trying
+13:00  editor starts, server comes back, nothing connects to it
+```
+
+To get it back, open the extension popup and press **Reconnect**, which resets
+the counter and dials again. Restarting the extension or Firefox does the same
+thing the slow way.
+
+**Raise the Retry Interval if you use this mode.** The extension's options page
+accepts 1000 to 60000 ms. The 50-attempt budget is spent at whatever rate you
+set, so 60000 ms buys 50 minutes of quiet instead of four:
+
+| Retry Interval | Budget before it stops | Delay picking up a new server |
+|---|---|---|
+| 5000 ms (default) | 4 minutes | up to 5 seconds |
+| 30000 ms | 25 minutes | up to 30 seconds |
+| 60000 ms (max) | 50 minutes | up to 1 minute |
+
+The cost is the third column: a longer interval means the extension takes longer
+to notice the server your client just started, which widens the first problem
+while narrowing the second.
+
+**Which mode to use.** It depends on how long your client lives, not on which
+client it is.
+
+A desktop client you open in the morning and leave running, such as Claude
+Desktop, holds one server all day. The gap opens once, at startup, and the
+extension has reconnected long before you ask for anything.
+
+A terminal client is the opposite. Every `claude` invocation starts a server and
+kills it on exit, so a morning of short sessions cycles the server all morning.
+Each session pays the first-call gap, and the time between sessions comes out of
+the 50-attempt budget. This is the case the example command at the top of this
+section configures, which is why it is worth saying plainly.
+
+If that is how you work, HTTP mode avoids all of it: one server, started once,
+outliving every client and every session, with no port to contend for.
 
 ## Reducing the Tool Surface
 
@@ -154,6 +295,10 @@ server = FoxMCPServer(port=8765, start_mcp=False)
 1. **Start the server** (both WebSocket and MCP servers)
 2. **Load Firefox extension** (connects automatically to WebSocket)
 3. **Connect MCP client** to `http://localhost:3000`
+
+Or let the client start the server for you — see
+[Serving MCP over stdio](#serving-mcp-over-stdio), where step 1 is the client's
+job and step 3 does not apply.
 
 ### Supported MCP Clients
 
@@ -317,8 +462,14 @@ A timeout returns an error dict rather than raising, so callers must check for
 `"error"` in the response.
 
 **Extension reconnection.** `CONFIG` at the top of `extension/background.js` sets
-`retryInterval` (5000 ms) and `maxRetries` (`-1`, meaning retry forever). Both are also
-editable from the extension popup. Changing the source values requires a rebuild.
+`retryInterval` (5000 ms) and `maxRetries` (`-1`). Both are also editable from the
+extension popup. Changing the source values requires a rebuild.
+
+`-1` means "no limit of my own", not "retry forever". `MAX_ABSOLUTE_RETRIES` in the
+same file caps every setting at 50 attempts, after which the extension stops until
+you press **Reconnect** in the popup or restart it. At the default interval that is
+about four minutes of downtime. This matters most under `--stdio`, where the server
+comes and goes with your client: see [The reconnect gap](#the-reconnect-gap).
 
 ## Troubleshooting Configuration
 

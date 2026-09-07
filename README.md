@@ -147,6 +147,27 @@ claude mcp add --transport http foxmcp http://localhost:3000/mcp/
 **For Other MCP Clients**:
 Connect to `http://localhost:3000/mcp/`
 
+**Or let the client start the server.** With `--stdio` the server speaks MCP on
+stdin and stdout instead of HTTP, so a client launches it on demand and there is
+no step 3 to remember:
+
+```bash
+claude mcp add --scope project foxmcp -- $PWD/venv/bin/python \
+  $PWD/server/server.py --stdio
+```
+
+The extension connects the same way it always does, but two costs come with this
+mode. Only one server can serve the extension, and under stdio every client
+launches its own, so two `claude` sessions at once means the second one gets no
+browser tools. And the server lives only as long as your client, while the
+extension stops trying to reconnect after about four minutes without one.
+
+If you run several clients, or short terminal sessions through the day, HTTP mode
+is the easier setup. Read [One session at a
+time](docs/configuration.md#one-session-at-a-time) and [The reconnect
+gap](docs/configuration.md#the-reconnect-gap) first. The same page has the
+`.mcp.json` any client can use.
+
 ## Basic Usage
 
 Once connected, you can control Firefox through natural language:
@@ -209,6 +230,9 @@ python server/server.py --port 9000 --mcp-port 4000
 
 # WebSocket only (no MCP)
 python server/server.py --no-mcp
+
+# MCP on stdin/stdout, for a client that launches the server itself
+python server/server.py --stdio
 
 # Bind a different host
 python server/server.py --host 127.0.0.1

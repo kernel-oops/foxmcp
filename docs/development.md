@@ -187,12 +187,17 @@ make clean && make package && rm -rf dist/profile-cache/*
 
 ### Server
 
-The server takes `--host`, `--port`, `--mcp-port`, `--no-mcp`, `--disable-tools` and
-`--enable-tools`:
+The server takes `--host`, `--port`, `--mcp-port`, `--no-mcp`, `--stdio`,
+`--disable-tools` and `--enable-tools`:
 
 ```bash
 cd server && python server.py --port 8767
 ```
+
+Under `--stdio` the server's stdout carries the MCP protocol, so its logging —
+and anything else with something to say — goes to stderr, where the client
+collects it; most keep a log per MCP server. Nothing in `server/` may call
+`print()`, and `tests/unit/test_stdio_mode.py` fails if something does.
 
 ### Extension
 
