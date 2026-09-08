@@ -6,6 +6,80 @@ For the full, entry-by-entry record of every release, see
 [CHANGELOG.md](CHANGELOG.md) — that is the file a release's GitHub notes are
 generated from.
 
+## v1.3.0 - Launching the Server From Your Client (2026-09-07)
+
+### ✨ Feature Release
+
+Two new ways to control how the server presents itself to an MCP client. Nothing
+is removed, and an existing setup keeps working untouched.
+
+**The extension is unchanged from v1.2.0.** This release touches only the Python
+server, so the add-on you already have is the right one. If you installed from
+addons.mozilla.org, there is nothing to update there.
+
+### `--stdio` lets your MCP client start the server
+
+Most MCP clients, Claude Code and Claude Desktop among them, launch their servers
+as child processes and talk to them over pipes. FoxMCP only ever listened on
+HTTP, so it had to be started by hand and left running, which is what
+[issue #3](https://github.com/ThinkerYzu/foxmcp/issues/3) asked about. This is now
+enough:
+
+```bash
+claude mcp add --scope project foxmcp -- /path/to/venv/bin/python /path/to/server/server.py --stdio
+```
+
+The server then lives and dies with the client. The browser half does not change:
+the WebSocket still listens on 8765, and every tool behaves as it does over HTTP.
+
+Two costs come with the mode, both following from the extension being the side
+that opens the WebSocket connection.
+
+| Cost | What you see | What to do about it |
+|---|---|---|
+| One session at a time | A second `claude` session has no browser tools at all, because its own server cannot bind port 8765 | Use HTTP mode when you run more than one session at once |
+| The reconnect gap | After roughly four minutes with no server to reach, the extension stops trying | Set Retry Interval to 60000 ms, which buys 50 minutes, or press **Reconnect** in the popup |
+
+Neither is a misconfiguration you can settle by editing a file, so prefer HTTP if
+either one would bite. See
+[Serving MCP over stdio](docs/configuration.md#serving-mcp-over-stdio),
+[One session at a time](docs/configuration.md#one-session-at-a-time) and
+[The reconnect gap](docs/configuration.md#the-reconnect-gap).
+
+### `--enable-tools` keeps one tool out of a group you disabled
+
+`--disable-tools`, added in v1.2.0, works a group at a time, and sometimes a
+single tool in the group is the one worth its tokens.
+[Issue #6](https://github.com/ThinkerYzu/foxmcp/issues/6) asked for a screenshot
+of the page without the five tab-management tools that come with it:
+
+```bash
+python server/server.py --disable-tools tabs --enable-tools tabs_capture_screenshot
+```
+
+`FOXMCP_ENABLE_TOOLS` does the same for clients that launch the server through a
+wrapper whose arguments you cannot control. Names are the ones your client sees,
+and one that matches no tool is an error rather than a warning, since otherwise
+the symptom is the single tool you asked for quietly missing.
+
+`tabs_capture_screenshot` makes the good example because it captures the visible
+tab and takes no tab ID, so it stands on its own. Most other tools take a
+`tab_id` that in practice comes from `tabs_list`, and enabling one of those alone
+leaves you nothing to address it with. See
+[Keeping one tool out of a disabled group](docs/configuration.md#keeping-one-tool-out-of-a-disabled-group).
+
+### 📋 Upgrading
+
+Replace the server and restart it. Leave the extension alone.
+
+```bash
+curl -L https://github.com/ThinkerYzu/foxmcp/releases/download/v1.3.0/install-from-github.sh | bash
+```
+
+If you switch to `--stdio`, drop the `--mcp-port` and `--no-mcp` arguments from
+your old command line. Passing either alongside `--stdio` is refused rather than
+ignored, because in stdio mode no HTTP listener is opened for them to configure.
+
 ## v1.2.0 - Security and Context (2026-08-14)
 
 ### 🔒 Security Release

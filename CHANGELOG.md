@@ -5,7 +5,7 @@ All notable changes to FoxMCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-09-07
 
 ### Added
 - **`--stdio` serves MCP on stdin and stdout, so a client can launch the server itself.** Most MCP clients — Claude Code and Claude Desktop among them — start their servers as child processes and speak to them over pipes; FoxMCP only ever listened on HTTP, so it had to be started by hand and left running, which is what [issue #3](https://github.com/ThinkerYzu/foxmcp/issues/3) asked about. `claude mcp add --scope project foxmcp -- /path/to/venv/bin/python /path/to/server/server.py --stdio` is now enough, and the server lives and dies with the client. The extension side is unchanged: the WebSocket server still listens on 8765 and every tool works as it does over HTTP. Since stdout now carries the JSON-RPC framing, all logging goes to stderr and nothing in `server/` may `print()`. `--stdio` with `--mcp-port` or `--no-mcp` is refused rather than silently ignored, and a server that cannot bind the extension's port says which port and why, then exits non-zero — only one server can serve the extension, and in stdio mode every client launches one. Two costs come with the mode, and both follow from the extension being the side that opens the WebSocket connection. Only one server can serve it, and under stdio every client launches its own, so two `claude` sessions at once leaves the second without browser tools. And tying the server's life to a client leaves a gap at each restart, which the extension gives up on after roughly four minutes with no server to reach. See [`docs/configuration.md`](docs/configuration.md#serving-mcp-over-stdio), [One session at a time](docs/configuration.md#one-session-at-a-time) and [The reconnect gap](docs/configuration.md#the-reconnect-gap) for what to set and when to prefer HTTP.
@@ -218,6 +218,7 @@ error. See **Removed** below.
 ### Initial Release Scope
 This v1.0.0 release represents a complete, production-ready browser automation solution that enables AI assistants and automation tools to control Firefox browsers through the standardized Model Context Protocol (MCP).
 
+[1.3.0]: https://github.com/ThinkerYzu/foxmcp/releases/tag/v1.3.0
 [1.2.0]: https://github.com/ThinkerYzu/foxmcp/releases/tag/v1.2.0
 [1.1.0]: https://github.com/ThinkerYzu/foxmcp/releases/tag/v1.1.0
 [1.0.0]: https://github.com/ThinkerYzu/foxmcp/releases/tag/v1.0.0
