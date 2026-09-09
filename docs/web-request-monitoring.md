@@ -38,9 +38,15 @@ requests_get_content(monitor_id="mon_1755205412345", request_id="1234")
 requests_stop_monitoring(monitor_id="mon_1755205412345")
 ```
 
+A request is listed once it has completed, and step 2 above returns before that
+happens: `tabs_create` and `navigation_reload` both come back as soon as the browser
+has been told what to do, not when the page has loaded. Listing straight after one of
+them gives an empty list on a monitor that is working perfectly.
+
 Captured data outlives the monitor: `requests_list_captured` and
 `requests_get_content` still answer after `requests_stop_monitoring`. What ends is
-the capturing, not the record.
+the capturing, not the record. It does not outlive the connection, though: see
+[How long a monitor lives](#how-long-a-monitor-lives).
 
 Stopping also returns statistics — duration, requests per second, and
 `total_data_size`. Read the last one as a lower bound: it sums the `Content-Length`
@@ -48,17 +54,46 @@ each response declared, which compressed HTTP/2 responses routinely omit, and th
 count as zero. The measured `size_bytes` from `requests_get_content` is the
 trustworthy figure, per request.
 
+## How long a monitor lives
+
+A monitor lives in the extension, not in the server, so it survives a server
+restart on its own. Only the client that started it knows its `monitor_id`, which
+is why it does not outlive that client:
+
+| What happens | The monitors it ends |
+|---|---|
+| `requests_stop_monitoring` | that one, and its captured data stays readable |
+| Your MCP client disconnects | every monitor that client started, within a few seconds |
+| The extension loses its server, or you press **Reconnect** | all of them, captured data included |
+| The extension answers for a monitor no client owns | that one, on sight |
+
+The middle two are the same rule seen from either side. The last is the backstop for
+the two halves drifting apart, which takes an extension and a server that disagree
+about whether a monitor survived a connection: whichever side let go, the monitor is
+capturing for a reader that cannot reach it, and the server stops it the moment the
+extension mentions it. A monitor whose client has
+gone can never be read or stopped again, and it is not harmless while it sits
+there: the extension keeps its `webRequest` listeners registered and goes on
+filtering response bodies for a reader that will not come back.
+
+`requests_list_captured` and `requests_get_content` answer `MONITOR_NOT_FOUND` for
+an id that has been cleared. That matters more than it sounds: an empty list is
+what a healthy monitor returns before anything has completed, so a monitor that
+has quietly gone and one that is simply early would otherwise look identical.
+
 ## URL patterns
 
 A pattern is a glob, not a WebExtensions match pattern. `*` becomes `.*`, `?`
 becomes `.`, and the result is tested against the full URL as an **unanchored**
 regular expression — so `example.org` matches `https://example.org/a` and
-`https://cdn.example.org/b` alike. The bare pattern `*` is special-cased to match
-everything.
+`https://cdn.example.org/b` alike. Two patterns are special-cased to match
+everything: the bare `*`, and `<all_urls>`, which holds no wildcard of its own and
+is accepted because it is the spelling a WebExtensions caller reaches for.
 
 | Pattern | Matches |
 |---|---|
 | `*` | every request |
+| `<all_urls>` | every request |
 | `https://example.org/*` | anything under that origin |
 | `*/api/*` | any URL with `/api/` in the path |
 | `.json` | any URL containing `.json`, anywhere |

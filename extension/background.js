@@ -124,9 +124,10 @@ function connectToMCPServer() {
     console.log(`🔗 Connecting to ${WS_URL} (attempt ${retryAttempts + 1})`);
     console.log(`🔧 Using CONFIG:`, JSON.stringify(CONFIG, null, 2));
 
-    websocket = new WebSocket(WS_URL);
+    const socket = new WebSocket(WS_URL);
+    websocket = socket;
 
-    websocket.onopen = () => {
+    socket.onopen = () => {
       console.log('Connected to MCP server');
       isConnected = true;
       retryAttempts = 0; // Reset retry counter on successful connection
@@ -145,19 +146,32 @@ function connectToMCPServer() {
       }
     };
 
-    websocket.onmessage = async (event) => {
+    socket.onmessage = async (event) => {
       // Test debug message right when we receive a message
       console.log('📨 Extension received message from server');
       await handleMessage(JSON.parse(event.data));
     };
 
-    websocket.onclose = () => {
+    socket.onclose = () => {
+      // Reconnect only if this socket is still the live one.
+      //
+      // close() fires this handler for a deliberate disconnect as well, and
+      // every deliberate disconnect is already followed by a new connection.
+      // Without the guard, that close schedules a reconnect whose timer then
+      // closes the healthy socket it finds and opens another, whose close
+      // schedules the next: a connect/close cycle every retryInterval that no
+      // retry cap stops, since retryAttempts resets on each successful open.
+      if (websocket !== socket) {
+        return;
+      }
+
       console.log('Disconnected from MCP server');
       isConnected = false;
+      clearAllMonitors('the connection to the server dropped');
       scheduleReconnect();
     };
 
-    websocket.onerror = (error) => {
+    socket.onerror = (error) => {
       console.error('WebSocket error:', error);
     };
   } catch (error) {
@@ -262,6 +276,7 @@ function disconnect() {
     websocket = null;
   }
   isConnected = false;
+  clearAllMonitors('the connection to the server was closed');
 }
 
 async function handleMessage(message) {
@@ -956,6 +971,28 @@ function setupWebRequestListeners() {
   console.log('✅ WebRequest listeners registered');
 }
 
+// Drop every monitor and everything they captured.
+//
+// A monitor lives in this page, which outlives any one server, and only the
+// client that started it knows its id. Once the connection carrying that client
+// is gone the monitor can never be read or stopped again, while it goes on
+// holding the webRequest listeners up and filtering response bodies for nobody.
+// The captured data goes with the monitors for the same reason: the request ids
+// that reach it come from requests.list_captured.
+function clearAllMonitors(reason) {
+  const monitorCount = activeMonitors.size;
+
+  activeMonitors.clear();
+  capturedRequests.clear();
+  requestDetails.clear();
+  capturedResponseBodies.clear();
+
+  if (monitorCount > 0) {
+    stopWebRequestMonitoring();
+    console.log(`🧹 Cleared ${monitorCount} monitor(s): ${reason}`);
+  }
+}
+
 function stopWebRequestMonitoring() {
   if (activeMonitors.size > 0) {
     // Still have active monitors
@@ -1006,7 +1043,9 @@ function shouldCaptureRequest(monitor, details) {
   if (monitor.url_patterns && monitor.url_patterns.length > 0) {
     const url = details.url;
     return monitor.url_patterns.some(pattern => {
-      if (pattern === '*') return true;
+      // <all_urls> is not glob syntax, but it is what a WebExtensions caller
+      // reaches for, and as a glob it matches nothing at all.
+      if (pattern === '*' || pattern === '<all_urls>') return true;
 
       // Convert glob pattern to regex
       const regexPattern = pattern
@@ -1029,19 +1068,25 @@ function captureRequestEvent(monitorId, eventType, details) {
   const requestId = details.requestId;
   const timestamp = new Date().toISOString();
 
-  // Get or create request record
+  // One record per request id, shared by every monitor that matches it.
+  //
+  // The WebRequest API delivers each event once however many monitors want it,
+  // and requests.get_content reads the record by request id alone. Anything
+  // per-monitor therefore has to be keyed by monitor: listed_by holds the
+  // monitors that already have this request in capturedRequests, so each of
+  // them lists it exactly once.
   let request = requestDetails.get(requestId);
   if (!request) {
     request = {
       request_id: requestId,
-      monitor_id: monitorId,
       url: details.url,
       method: details.method || 'GET',
       tab_id: details.tabId,
       frame_id: details.frameId,
       type: details.type,
       timestamp: timestamp,
-      events: []
+      events: [],
+      listed_by: new Set()
     };
     requestDetails.set(requestId, request);
   }
@@ -1098,7 +1143,7 @@ function captureRequestEvent(monitorId, eventType, details) {
   request.events.push(event);
 
   // If request is complete, add to captured list
-  if (request.completed && !request.added_to_list) {
+  if (request.completed && !request.listed_by.has(monitorId)) {
     const captured = capturedRequests.get(monitorId) || [];
     captured.push({
       request_id: requestId,
@@ -1114,7 +1159,7 @@ function captureRequestEvent(monitorId, eventType, details) {
       response_content_type: request.response_content_type || null
     });
     capturedRequests.set(monitorId, captured);
-    request.added_to_list = true;
+    request.listed_by.add(monitorId);
 
     const sizeInfo = request.response_content_length ? ` (${request.response_content_length} bytes)` : '';
     console.log(`📋 Captured request: ${request.method} ${request.url} -> ${request.status_code || 'ERROR'}${sizeInfo}`);
@@ -1353,7 +1398,17 @@ async function handleRequestsAction(id, action, data) {
         break;
 
       case 'requests.list_captured':
-        const monitorRequests = capturedRequests.get(data.monitor_id) || [];
+        // An id nobody knows is an error rather than an empty list, which reads
+        // the same as a monitor that is running and has caught nothing yet.
+        // Monitors do not always end where the caller ended them: losing the
+        // server connection clears every one of them.
+        if (!capturedRequests.has(data.monitor_id)) {
+          sendError(id, 'MONITOR_NOT_FOUND',
+            `Monitor ${data.monitor_id} not found. It was never started, or the connection that started it has since closed.`);
+          break;
+        }
+
+        const monitorRequests = capturedRequests.get(data.monitor_id);
 
         sendResponse(id, action, {
           monitor_id: data.monitor_id,

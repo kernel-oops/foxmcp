@@ -1373,6 +1373,10 @@ class FoxMCPTools:
         async def navigation_reload(tab_id: int, bypass_cache: bool = False) -> str:
             """Reload a page in a tab
 
+            Returns as soon as the reload is issued, not when the page has
+            finished loading. Code that watches for what the reload does - a
+            request monitor, a content read - has to wait for the page itself.
+
             Args:
                 tab_id: ID of the tab to reload
                 bypass_cache: Whether to bypass cache when reloading (default: False)
@@ -1740,6 +1744,32 @@ class FoxMCPTools:
                 logger.exception(f"Predefined script {script_name!r} raised an unexpected error")
                 return f"Unexpected error running script '{script_name}': {e}"
 
+    def _remember_monitor_owner(self, monitor_id):
+        """Tie a monitor just started to the MCP client that asked for it
+
+        The server stops a client's monitors when that client disconnects, and
+        this is where it learns whose they are. Every monitor is recorded, session
+        or no session: one started outside a transport has no client to outlive it
+        and is never reaped, but a monitor missing from the registry altogether is
+        taken for a stray and stopped on sight.
+        """
+        if not monitor_id:
+            return
+
+        register = getattr(self.websocket_server, 'register_monitor', None)
+        if register is None:
+            return
+
+        try:
+            from fastmcp.server.dependencies import get_context
+            session_id = get_context().session_id
+        except Exception:
+            # Reached in-process rather than over a transport, as the test harness
+            # does. register_monitor records its own marker for that.
+            session_id = None
+
+        register(monitor_id, session_id)
+
     def _setup_request_monitoring_tools(self):
         """Setup web request monitoring tools"""
 
@@ -1807,6 +1837,7 @@ class FoxMCPTools:
                 return json.dumps({"error": f"Failed to start monitoring: {response['error']}"})
 
             if response.get("type") == "response" and "data" in response:
+                self._remember_monitor_owner(response["data"].get("monitor_id"))
                 return json.dumps(response["data"])
             elif response.get("type") == "error":
                 error_msg = response.get("data", {}).get("message", "Unknown error")
@@ -1846,6 +1877,9 @@ class FoxMCPTools:
                 return json.dumps({"error": f"Failed to stop monitoring: {response['error']}"})
 
             if response.get("type") == "response" and "data" in response:
+                forget = getattr(self.websocket_server, 'forget_monitor', None)
+                if forget:
+                    forget(monitor_id)
                 return json.dumps(response["data"])
             elif response.get("type") == "error":
                 error_msg = response.get("data", {}).get("message", "Unknown error")
@@ -1857,6 +1891,9 @@ class FoxMCPTools:
         async def requests_list_captured(monitor_id: str) -> str:
             """
             List all captured request summaries from a monitoring session
+
+            A request appears here once it has completed, so a page navigation
+            started a moment ago will not be in the list yet.
 
             Args:
                 monitor_id: ID of the monitoring session

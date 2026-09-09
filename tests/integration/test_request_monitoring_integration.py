@@ -416,3 +416,191 @@ class TestRequestMonitoringIntegration:
 
         # Verify all requests were sent
         assert len(mock_extension_server.sent_messages) >= 3
+
+class TestMonitorsFollowTheirClient:
+    """A monitor belongs to the MCP client that started it, and ends when it goes"""
+
+    @pytest.mark.asyncio
+    async def test_monitor_stops_when_its_mcp_client_disconnects(self):
+        """The server stops a departed client's monitors, and only those
+
+        A monitor lives in the extension, which outlives every MCP client, and
+        only the client that started one knows its id. Left behind it keeps the
+        extension's webRequest listeners registered for a reader that will never
+        come back.
+
+        Both directions are checked here because a reaper that stopped monitors
+        indiscriminately would pass the first assertion on its own.
+        """
+        from fastmcp import Client
+        from test_config import connect_as_extension
+
+        websocket_port = get_port_by_type('test_individual')
+        mcp_port = get_port_by_type('test_mcp_individual')
+
+        server = FoxMCPServer(host="localhost", port=websocket_port,
+                              mcp_port=mcp_port, start_mcp=True)
+        server.MONITOR_REAP_INTERVAL = 0.5
+        server_task = asyncio.create_task(server.start_server())
+        await asyncio.sleep(1.0)
+
+        stop_requests = asyncio.Queue()
+
+        async def answer_as_extension(extension):
+            """Stand in for the extension: hand out a monitor id, note the stops"""
+            while True:
+                request = json.loads(await extension.recv())
+                action = request['action']
+
+                if action == 'requests.start_monitoring':
+                    data = {'monitor_id': 'mon_owned', 'status': 'active'}
+                elif action == 'requests.stop_monitoring':
+                    await stop_requests.put(request['data']['monitor_id'])
+                    data = {'monitor_id': request['data']['monitor_id'], 'status': 'stopped',
+                            'total_requests_captured': 0}
+                else:
+                    data = {}
+
+                await extension.send(json.dumps({
+                    'id': request['id'], 'type': 'response', 'action': action, 'data': data
+                }))
+
+        try:
+            async with connect_as_extension(f"ws://localhost:{websocket_port}") as extension:
+                responder = asyncio.create_task(answer_as_extension(extension))
+                await asyncio.sleep(0.3)
+
+                try:
+                    async with Client(f"http://localhost:{mcp_port}/mcp") as client:
+                        await client.call_tool('requests_start_monitoring',
+                                               {'url_patterns': ['*']})
+
+                        assert 'mon_owned' in server.monitor_owners, \
+                            "The monitor should be tied to the client that started it"
+
+                        # Several reaper passes with the client still connected
+                        await asyncio.sleep(2.0)
+                        assert stop_requests.empty(), \
+                            "A monitor was stopped while its client was still connected"
+
+                    stopped = await asyncio.wait_for(stop_requests.get(), timeout=10.0)
+                    assert stopped == 'mon_owned', f"Wrong monitor stopped: {stopped}"
+                    assert not server.monitor_owners, \
+                        f"Ownership record outlived the monitor: {server.monitor_owners}"
+                finally:
+                    responder.cancel()
+        finally:
+            await server.shutdown(server_task)
+
+    @pytest.mark.asyncio
+    async def test_a_monitor_the_server_never_recorded_is_stopped(self):
+        """A reply naming a monitor no client owns has that monitor stopped
+
+        The two sides can drift only if one lets go of a monitor the other keeps:
+        an extension too old to clear its monitors when a connection ends, or a
+        server that has forgotten an owner. Whichever way round, the monitor is
+        capturing for a reader that cannot reach it.
+
+        Driven through handle_extension_message rather than a live browser,
+        because a matched pair of halves never produces the message under test.
+        """
+        websocket_port = get_port_by_type('test_individual')
+        mcp_port = get_port_by_type('test_mcp_individual')
+
+        server = FoxMCPServer(host="localhost", port=websocket_port,
+                              mcp_port=mcp_port, start_mcp=False)
+
+        sent = []
+
+        async def record_request(request, timeout=30.0):
+            sent.append(request)
+            return {'type': 'response', 'action': request['action'],
+                    'data': {'monitor_id': request['data']['monitor_id'], 'status': 'stopped'}}
+
+        server.send_request_and_wait = record_request
+
+        listing = json.dumps({
+            'id': 'some-request', 'type': 'response', 'action': 'requests.list_captured',
+            'data': {'monitor_id': 'mon_stray', 'total_requests': 3, 'requests': []}
+        })
+        await server.handle_extension_message(listing)
+        await asyncio.sleep(0.2)
+
+        assert [r['action'] for r in sent] == ['requests.stop_monitoring'], \
+            f"The stray monitor should have been stopped once: {sent}"
+        assert sent[0]['data']['monitor_id'] == 'mon_stray'
+
+        # A monitor the server does know about is left alone
+        sent.clear()
+        server.register_monitor('mon_owned', 'a-session')
+        await server.handle_extension_message(json.dumps({
+            'id': 'another-request', 'type': 'response', 'action': 'requests.list_captured',
+            'data': {'monitor_id': 'mon_owned', 'total_requests': 1, 'requests': []}
+        }))
+        await asyncio.sleep(0.2)
+
+        assert sent == [], f"A monitor with an owner must not be stopped: {sent}"
+
+    @pytest.mark.asyncio
+    async def test_starting_a_monitor_does_not_stop_it(self):
+        """The reply that creates a monitor is not evidence that it is a stray
+
+        The owner is recorded from the tool, after the extension's reply has been
+        handled, so for the length of that gap the new monitor is absent from the
+        registry. Reading the reply as a stray would stop every monitor at birth.
+        """
+        websocket_port = get_port_by_type('test_individual')
+        mcp_port = get_port_by_type('test_mcp_individual')
+
+        server = FoxMCPServer(host="localhost", port=websocket_port,
+                              mcp_port=mcp_port, start_mcp=False)
+
+        sent = []
+
+        async def record_request(request, timeout=30.0):
+            sent.append(request)
+            return {'type': 'response', 'data': {}}
+
+        server.send_request_and_wait = record_request
+
+        for action in ('requests.start_monitoring', 'requests.stop_monitoring'):
+            await server.handle_extension_message(json.dumps({
+                'id': f'reply-for-{action}', 'type': 'response', 'action': action,
+                'data': {'monitor_id': 'mon_fresh', 'status': 'active'}
+            }))
+        await asyncio.sleep(0.2)
+
+        assert sent == [], f"Lifecycle replies must not be read as strays: {sent}"
+
+    @pytest.mark.asyncio
+    async def test_live_sessions_unknown_reaps_nothing(self):
+        """With no way to tell which clients are connected, no monitor is stopped
+
+        `_live_mcp_session_ids` reads a private attribute of the MCP SDK's session
+        manager. If a version moves it, the answer is None, and None must not be
+        read as "every client has gone" - that would stop monitors of clients that
+        are sitting right there.
+        """
+        websocket_port = get_port_by_type('test_individual')
+        mcp_port = get_port_by_type('test_mcp_individual')
+
+        server = FoxMCPServer(host="localhost", port=websocket_port,
+                              mcp_port=mcp_port, start_mcp=False)
+        server.register_monitor('mon_orphan', 'session-that-is-long-gone')
+
+        sent = []
+
+        async def record_request(request, timeout=30.0):
+            sent.append(request)
+            return {'type': 'response', 'data': {}}
+
+        server.send_request_and_wait = record_request
+        server.extension_connection = object()
+
+        assert server._live_mcp_session_ids() is None, \
+            "No MCP app means no answer, not an empty set of clients"
+
+        await server.stop_monitors_of_gone_clients()
+
+        assert sent == [], "Nothing may be stopped on an unknown answer"
+        assert 'mon_orphan' in server.monitor_owners

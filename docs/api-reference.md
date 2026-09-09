@@ -74,6 +74,11 @@ and what each group costs.
   - Captured data outlives the monitor: the two tools below still answer afterwards
 - `requests_list_captured(monitor_id)` - List captured request summaries
   - Returns JSON with array of request summaries (metadata only, no full content)
+  - A request appears once it has completed, so a navigation started a moment ago
+    is not in the list yet
+  - `MONITOR_NOT_FOUND` for an id that never existed or has been cleared. Monitors
+    are cleared when the client that started them disconnects, and when the
+    extension loses its connection to the server
 - `requests_get_content(monitor_id, request_id, include_binary=False, save_request_body_to=None, save_response_body_to=None)` - Get full request/response content
   - `include_binary`: **ignored** — non-text bodies never come back as content, only as a size
   - `save_request_body_to`, `save_response_body_to`: **ignored** — `saved_to_file` is always `null`

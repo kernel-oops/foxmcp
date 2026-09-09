@@ -1053,7 +1053,18 @@ reference above.
 }
 ```
 
-An unknown `monitor_id` is answered with `MONITOR_NOT_FOUND`.
+An unknown `monitor_id` is answered with `MONITOR_NOT_FOUND`, by
+`requests.list_captured` as well as `requests.stop_monitoring`.
+
+The server sends `requests.stop_monitoring` on its own account in two cases: for
+monitors whose MCP client has disconnected, and for a monitor named in a message
+from the extension that no client owns. The extension clears every monitor it holds
+when the WebSocket connection closes, so nothing has to be sent for that case.
+
+The replies to `requests.start_monitoring` and `requests.stop_monitoring` are exempt
+from the second rule. One names a monitor the server is about to record, the other a
+monitor it has just removed, and reading either as a stray would stop every monitor
+at birth or answer each removal with another.
 
 ## Error Messages
 

@@ -420,6 +420,110 @@ class TestRequestMonitoringEndToEnd:
         print("✅ Response body capture verification completed")
 
     @pytest.mark.asyncio
+    async def test_concurrent_monitors_each_capture(self, full_monitoring_system):
+        """Every monitor matching a request lists it, not just the oldest one
+
+        The extension keeps one record per request id, shared by all monitors,
+        and a single flag on it used to mean the first monitor to match claimed
+        the request outright. Every later monitor then read zero for as long as
+        the older one stayed active, which is what an agent hits when it starts
+        a fresh monitor after an earlier attempt it never stopped.
+
+        The third pattern is <all_urls>. Patterns here are globs, so the
+        WebExtensions spelling holds no wildcard and matched nothing at all.
+        """
+        system = full_monitoring_system
+        mcp_client = system['mcp_client']
+
+        await mcp_client.connect()
+
+        async def start_monitor(patterns):
+            result = await mcp_client.call_tool("requests_start_monitoring", {
+                "url_patterns": patterns
+            })
+            data = json.loads(result['content'])
+            assert 'monitor_id' in data, f"No monitor_id in {result}"
+            return data['monitor_id']
+
+        async def captured_urls(monitor_id):
+            result = await mcp_client.call_tool("requests_list_captured", {
+                "monitor_id": monitor_id
+            })
+            return [req['url'] for req in json.loads(result['content'])['requests']]
+
+        monitors = [
+            ("first", await start_monitor(["https://example.org/*"])),
+            ("second", await start_monitor(["https://example.org/*"])),
+            ("all_urls", await start_monitor(["<all_urls>"])),
+        ]
+
+        try:
+            await mcp_client.call_tool("tabs_create", {
+                "url": "https://example.org/",
+                "active": True
+            })
+            await asyncio.sleep(5.0)
+
+            captured = {name: await captured_urls(monitor_id) for name, monitor_id in monitors}
+            print(f"Captured per monitor: { {k: len(v) for k, v in captured.items()} }")
+
+            for name, urls in captured.items():
+                assert any('example.org' in url for url in urls), (
+                    f"monitor '{name}' captured no example.org request; "
+                    f"all three monitors saw: { {k: len(v) for k, v in captured.items()} }"
+                )
+        finally:
+            for _, monitor_id in monitors:
+                await mcp_client.call_tool("requests_stop_monitoring", {
+                    "monitor_id": monitor_id
+                })
+
+    @pytest.mark.asyncio
+    async def test_monitors_are_cleared_when_the_connection_drops(self, full_monitoring_system):
+        """Losing the server takes the monitors with it, and says so afterwards
+
+        Monitors live in the extension, which outlives any server. One that was
+        started over a connection that has since dropped can never be read or
+        stopped by anyone, because its id went with the client, so it is cleared
+        rather than left holding the webRequest listeners up.
+
+        The listing afterwards has to be an error: an empty list is what a healthy
+        monitor that has caught nothing yet returns, and telling those two apart is
+        the whole point.
+        """
+        system = full_monitoring_system
+        server = system['server']
+        mcp_client = system['mcp_client']
+
+        await mcp_client.connect()
+
+        start = await mcp_client.call_tool("requests_start_monitoring", {"url_patterns": ["*"]})
+        monitor_id = json.loads(start['content'])['monitor_id']
+
+        await mcp_client.call_tool("tabs_create", {"url": "https://example.org/", "active": True})
+        await asyncio.sleep(4.0)
+
+        listed = await mcp_client.call_tool("requests_list_captured", {"monitor_id": monitor_id})
+        assert json.loads(listed['content']).get('total_requests', 0) > 0, \
+            f"The monitor caught nothing before the drop, so the test proves nothing: {listed}"
+
+        # Drop the socket the way a restarted server would
+        dropped = server.extension_connection
+        await dropped.close()
+
+        for _ in range(100):
+            await asyncio.sleep(0.1)
+            current = server.extension_connection
+            if current is not None and current is not dropped:
+                break
+        assert server.extension_connection is not dropped, \
+            "Extension never reconnected, so the monitor's fate cannot be read"
+
+        after = await mcp_client.call_tool("requests_list_captured", {"monitor_id": monitor_id})
+        assert 'not found' in after['content'].lower(), \
+            f"The monitor should be gone with the connection that started it: {after}"
+
+    @pytest.mark.asyncio
     async def test_monitoring_api_registration(self, full_monitoring_system):
         """Test that all monitoring APIs are properly registered"""
         system = full_monitoring_system

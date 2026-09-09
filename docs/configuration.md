@@ -137,8 +137,16 @@ trying for an hour:
 13:00  editor starts, server comes back, nothing connects to it
 ```
 
+**A request monitor does not survive the gap.** The extension clears every monitor
+it holds, and everything they captured, whenever the connection to the server ends,
+which under `--stdio` is each time your client exits. Start monitoring, read what it
+caught, and stop it within the one client session; a `monitor_id` from an earlier
+session answers `MONITOR_NOT_FOUND`. See
+[How long a monitor lives](web-request-monitoring.md#how-long-a-monitor-lives).
+
 To get it back, open the extension popup and press **Reconnect**, which resets
-the counter and dials again. Restarting the extension or Firefox does the same
+the counter and dials again (and clears any monitors, as any other end of the
+connection does). Restarting the extension or Firefox does the same
 thing the slow way.
 
 **Raise the Retry Interval if you use this mode.** The extension's options page

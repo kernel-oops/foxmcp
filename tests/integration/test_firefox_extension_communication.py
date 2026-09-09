@@ -23,6 +23,7 @@ from server.server import FoxMCPServer
 from test_config import TEST_PORTS, connect_as_extension
 from firefox_test_utils import FirefoxTestManager
 from port_coordinator import get_port_by_type
+from mcp_client_harness import DirectMCPTestClient
 
 
 class TestFirefoxExtensionCommunication:
@@ -367,6 +368,91 @@ class TestFirefoxConnectionResilience:
                 
         finally:
             await server.shutdown(server_task)
+
+
+async def _distinct_connections(server, seconds, interval=0.05):
+    """Extension connections the server holds over a window, in order of arrival
+
+    Samples rather than counting accepts, because websockets.serve() captured
+    handle_extension_connection when the server started and a wrapper installed
+    afterwards would never be called. A connection that comes and goes between
+    two samples is missed, so keep the interval well under the extension's retry
+    interval, which the test profile sets to 1000 ms.
+    """
+    seen = []
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        current = server.extension_connection
+        if current is not None and (not seen or seen[-1] is not current):
+            seen.append(current)
+        await asyncio.sleep(interval)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_deliberate_reconnect_settles(server_with_extension):
+    """A reconnect asked for by the user leaves one connection, not a cycle
+
+    The popup's Reconnect button closes the socket and opens a new one. onclose
+    cannot see that the close was deliberate, so it also scheduled a reconnect,
+    whose timer then closed the healthy socket and opened another, whose close
+    scheduled the next. That is a connect/close cycle every retryInterval which
+    no retry cap stops, because retryAttempts resets on each successful open.
+    """
+    server = server_with_extension['server']
+    mcp_client = DirectMCPTestClient(server.mcp_tools)
+    await mcp_client.connect()
+
+    create_result = await mcp_client.call_tool("tabs_create", {
+        "url": "https://example.org/",
+        "active": True
+    })
+    tab_match = re.search(r'ID (\d+)', str(create_result.get('content', '')))
+    assert tab_match, f"Could not read a tab id from {create_result}"
+    tab_id = int(tab_match.group(1))
+
+    # forceReconnect is the popup's message, and a test has no popup. A content
+    # script can send it, and sending it on a timer keeps the close away from
+    # the socket this very call has to answer on.
+    script_result = await mcp_client.call_tool("content_execute_script", {
+        "tab_id": tab_id,
+        "code": "setTimeout(() => browser.runtime.sendMessage({action: 'forceReconnect'}), 1000); 'scheduled'"
+    })
+    assert not script_result.get('isError'), f"Could not reach the extension: {script_result}"
+
+    # Let the reconnect the user asked for happen and settle.
+    await asyncio.sleep(3.0)
+
+    connections = await _distinct_connections(server, seconds=5.0)
+    assert len(connections) == 1, (
+        f"{len(connections)} extension connections in 5 seconds after one "
+        "deliberate reconnect; the extension is cycling"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dropped_connection_still_reconnects(server_with_extension):
+    """A close the extension did not ask for still brings it back
+
+    The guard that stops a deliberate close from scheduling a reconnect must not
+    stop a real one, which is the only thing keeping the extension usable after
+    a server restart.
+    """
+    server = server_with_extension['server']
+    dropped = server.extension_connection
+    assert dropped is not None, "Fixture handed over no extension connection"
+
+    await dropped.close()
+
+    reconnected = None
+    for _ in range(100):
+        await asyncio.sleep(0.1)
+        current = server.extension_connection
+        if current is not None and current is not dropped:
+            reconnected = current
+            break
+
+    assert reconnected is not None, "Extension never reconnected after the socket was dropped"
 
 
 if __name__ == "__main__":

@@ -82,6 +82,21 @@ def find_available_port(start_port=3000, max_attempts=100):
     raise RuntimeError(f"Could not find available port starting from {start_port}")
 
 class FoxMCPServer:
+    # How often to check whether the MCP clients owning monitors are still there
+    MONITOR_REAP_INTERVAL = 5.0
+
+    # Owner recorded for a monitor started outside any MCP session, which is what
+    # a tool called in-process rather than over a transport gets. There is no
+    # client to outlive it, so it is never reaped - but it is still a monitor the
+    # server knows about, and that is what keeps it from being stopped as a stray.
+    NO_MCP_SESSION = "no-mcp-session"
+
+    # A reply naming a monitor the server has no record of is not evidence of a
+    # stray when the reply is what creates the record, or what confirms the
+    # removal. Excluding the second is also what stops a stray from being stopped
+    # over and over.
+    MONITOR_LIFECYCLE_ACTIONS = ("requests.start_monitoring", "requests.stop_monitoring")
+
     def __init__(self, host: str = "localhost", port: int = 8765, mcp_port: int = None, start_mcp: bool = True,
                  disabled_tool_groups=None, enabled_tools=None, use_stdio: bool = False):
         self.host = host
@@ -135,6 +150,14 @@ class FoxMCPServer:
         self.mcp_server_task = None
         self.mcp_thread = None
         self.mcp_server_instance = None
+
+        # Which MCP client asked for each running monitor, so its monitors can be
+        # stopped when it goes. Monitors live in the extension, which outlives
+        # every client, and only the client that started one knows its id.
+        self.monitor_owners = {}  # monitor_id -> MCP session id
+        self.monitors_being_stopped = set()
+        self.mcp_http_app = None
+        self.monitor_reaper_task = None
         self._shutdown_event = None
         self.websocket_server = None
 
@@ -188,7 +211,18 @@ class FoxMCPServer:
         except Exception as e:
             logger.error(f"Error handling extension connection: {e}")
         finally:
-            self.extension_connection = None
+            # Only the handler still holding the slot may clear it.
+            #
+            # An extension reconnecting closes its old socket and opens the new
+            # one at once, so this handler can finish after its replacement has
+            # already installed itself. Clearing unconditionally would blank out
+            # a live connection, and nothing sets it again until the extension
+            # reconnects. The monitors go with it because the extension clears
+            # its own the moment a connection ends, leaving these records with
+            # nothing to name.
+            if self.extension_connection is websocket:
+                self.extension_connection = None
+                self.monitor_owners.clear()
 
     async def handle_extension_message(self, message: str):
         """Process message from browser extension"""
@@ -212,6 +246,18 @@ class FoxMCPServer:
                 return
 
             logger.info(f"Received from extension: {message_type} - {action} (ID: {message_id})")
+
+            # The extension answered for a monitor the server has no record of,
+            # so nothing can reach it: stop it rather than leave it capturing.
+            #
+            # The two sides can only drift this way if one of them let go of a
+            # monitor the other kept - an extension too old to clear its monitors
+            # when a connection ends, or a server that has forgotten an owner. In
+            # a matched pair this never fires, which is why it is worth having: it
+            # is the case nobody planned for.
+            stray_monitor = self._stray_monitor_named_in(action, data)
+            if stray_monitor:
+                asyncio.create_task(self._stop_stray_monitor(stray_monitor))
 
             if message_type == 'request':
                 # Handle ping-pong for connection testing
@@ -329,6 +375,154 @@ class FoxMCPServer:
         except Exception as e:
             self.pending_requests.pop(request_id, None)
             return {"error": f"Request failed: {str(e)}"}
+
+    def register_monitor(self, monitor_id: str, session_id: str):
+        """Record the MCP client a newly started request monitor belongs to
+
+        Called by the requests_start_monitoring tool once the extension has
+        answered with an id. Monitors with no owner recorded are never reaped;
+        that is what happens when a tool is called outside an MCP session, as the
+        test harness does.
+        """
+        if monitor_id:
+            self.monitor_owners[monitor_id] = session_id or self.NO_MCP_SESSION
+
+    def forget_monitor(self, monitor_id: str):
+        """Drop a monitor the client stopped itself, so the reaper ignores it"""
+        self.monitor_owners.pop(monitor_id, None)
+
+    def _live_mcp_session_ids(self) -> Optional[set]:
+        """Sessions of the MCP clients still connected, or None if that cannot be told
+
+        None and the empty set mean different things: None is "no answer
+        available" and must not be read as "every client has gone".
+
+        `_server_instances` is private to the MCP SDK's
+        StreamableHTTPSessionManager, and fastmcp reaches into it the same way in
+        its own shutdown path. A terminated session stays in that dict rather than
+        being removed, so `is_terminated` is what separates a client that has gone
+        from one that is merely quiet.
+        """
+        app = self.mcp_http_app
+        if app is None:
+            return None
+
+        for route in getattr(app, 'routes', []):
+            manager = getattr(getattr(route, 'app', None), 'session_manager', None)
+            transports = getattr(manager, '_server_instances', None)
+            if transports is not None:
+                return {
+                    session_id
+                    for session_id, transport in list(transports.items())
+                    if not getattr(transport, 'is_terminated', False)
+                }
+
+        return None
+
+    async def stop_monitors_of_gone_clients(self):
+        """Stop every running monitor whose MCP client has disconnected
+
+        A monitor outlives the client that started it: it lives in the extension,
+        and only its creator ever knew its id. Left alone it keeps the extension's
+        webRequest listeners registered and filters response bodies nobody can
+        read.
+
+        A monitor whose extension has gone is forgotten here rather than stopped:
+        the extension clears its own monitors whenever a connection ends, so there
+        is nothing left to stop.
+        """
+        if not self.monitor_owners:
+            return
+
+        live_sessions = self._live_mcp_session_ids()
+        if live_sessions is None:
+            return
+
+        abandoned = [monitor_id for monitor_id, session_id in self.monitor_owners.items()
+                     if session_id != self.NO_MCP_SESSION and session_id not in live_sessions]
+
+        for monitor_id in abandoned:
+            self.monitor_owners.pop(monitor_id, None)
+
+            if not self.extension_connection:
+                continue
+
+            request = {
+                "id": f"reap_{monitor_id}",
+                "type": "request",
+                "action": "requests.stop_monitoring",
+                "data": {"monitor_id": monitor_id},
+                "timestamp": datetime.now().isoformat()
+            }
+            response = await self.send_request_and_wait(request, timeout=10.0)
+            if "error" in response or response.get("type") == "error":
+                detail = response.get("error") or response.get("data", {}).get("message", response)
+                logger.warning(f"Could not stop monitor {monitor_id} of a departed MCP client: {detail}")
+            else:
+                logger.info(f"Stopped monitor {monitor_id}: the MCP client that started it has gone")
+
+    def _stray_monitor_named_in(self, action: str, message: Dict[str, Any]) -> Optional[str]:
+        """The monitor id in a message from the extension that no client owns, if any
+
+        Returns None for the monitor lifecycle replies, which name ids the registry
+        is not expected to hold yet or any more.
+        """
+        if action in self.MONITOR_LIFECYCLE_ACTIONS:
+            return None
+
+        payload = message.get('data')
+        if not isinstance(payload, dict):
+            return None
+
+        monitor_id = payload.get('monitor_id')
+        if not monitor_id or monitor_id in self.monitor_owners:
+            return None
+
+        return monitor_id
+
+    async def _stop_stray_monitor(self, monitor_id: str):
+        """Stop a monitor the extension is running that no client can reach
+
+        Runs as its own task so the message being handled is not held up waiting
+        for the extension to answer this.
+        """
+        if monitor_id in self.monitors_being_stopped:
+            return
+
+        self.monitors_being_stopped.add(monitor_id)
+        try:
+            request = {
+                "id": f"stray_{monitor_id}",
+                "type": "request",
+                "action": "requests.stop_monitoring",
+                "data": {"monitor_id": monitor_id},
+                "timestamp": datetime.now().isoformat()
+            }
+            response = await self.send_request_and_wait(request, timeout=10.0)
+            if "error" in response or response.get("type") == "error":
+                detail = response.get("error") or response.get("data", {}).get("message", response)
+                logger.warning(f"Could not stop stray monitor {monitor_id}: {detail}")
+            else:
+                logger.info(f"Stopped stray monitor {monitor_id}: no MCP client owns it")
+        finally:
+            self.monitors_being_stopped.discard(monitor_id)
+
+    async def _reap_monitors(self):
+        """Poll for departed MCP clients for as long as the server runs
+
+        Polling rather than a callback because the MCP SDK offers no hook for a
+        session ending. Only started in HTTP mode: under --stdio the server has
+        the one client, and when it goes the process goes with it, which drops the
+        WebSocket and lets the extension clear its own monitors.
+        """
+        while True:
+            await asyncio.sleep(self.MONITOR_REAP_INTERVAL)
+            try:
+                await self.stop_monitors_of_gone_clients()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Error reaping monitors of departed clients: {e}")
 
     # Test Helper Methods
     async def get_popup_state(self, timeout: float = 30.0) -> Dict[str, Any]:
@@ -546,8 +740,9 @@ class FoxMCPServer:
                 logger.info(f"Starting MCP server on {self.host}:{self.mcp_port}")
 
                 # Create server config
+                self.mcp_http_app = self.mcp_app.http_app()
                 config = uvicorn.Config(
-                    self.mcp_app.http_app(),
+                    self.mcp_http_app,
                     host=self.host,
                     port=self.mcp_port,
                     log_level="error"  # Reduce log noise during tests
@@ -640,6 +835,14 @@ class FoxMCPServer:
         """Stop all servers (WebSocket and MCP)"""
         logger.info("Stopping FoxMCP server...")
 
+        if self.monitor_reaper_task:
+            self.monitor_reaper_task.cancel()
+            try:
+                await self.monitor_reaper_task
+            except asyncio.CancelledError:
+                pass
+            self.monitor_reaper_task = None
+
         # Stop MCP server
         self._stop_mcp_server()
 
@@ -713,6 +916,9 @@ class FoxMCPServer:
             raise
 
         logger.info("FoxMCP WebSocket server is running...")
+
+        if self.start_mcp and not self.use_stdio:
+            self.monitor_reaper_task = asyncio.create_task(self._reap_monitors())
 
         if self.start_mcp and self.use_stdio:
             await self._serve_mcp_over_stdio()
